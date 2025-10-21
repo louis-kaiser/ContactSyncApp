@@ -441,10 +441,14 @@ class ContactSyncViewModel: ObservableObject {
             if merged.jobTitle.isEmpty && !contact.jobTitle.isEmpty {
                 merged.jobTitle = contact.jobTitle
             }
-            if merged.note.isEmpty && !contact.note.isEmpty {
-                merged.note = contact.note
-            } else if !contact.note.isEmpty {
-                merged.note = merged.note + "\n" + contact.note
+            
+            // Merge notes - only if we have the key fetched
+            if contact.areKeysAvailable([CNContactNoteKey as CNKeyDescriptor]) {
+                if merged.note.isEmpty && !contact.note.isEmpty {
+                    merged.note = contact.note
+                } else if !contact.note.isEmpty && !merged.note.contains(contact.note) {
+                    merged.note = merged.note + "\n" + contact.note
+                }
             }
         }
         
@@ -554,6 +558,8 @@ class ContactSyncViewModel: ObservableObject {
     // MARK: - Fetch Keys
     
     private var fetchKeys: [CNKeyDescriptor] {
+        // Note: CNContactNoteKey requires com.apple.developer.contacts.notes entitlement
+        // Omitting it to avoid runtime crashes on apps without the entitlement
         [
             CNContactIdentifierKey,
             CNContactGivenNameKey,
@@ -567,8 +573,18 @@ class ContactSyncViewModel: ObservableObject {
             CNContactUrlAddressesKey,
             CNContactDatesKey,
             CNContactSocialProfilesKey,
-            CNContactInstantMessageAddressesKey,
-            CNContactNoteKey
+            CNContactInstantMessageAddressesKey
         ] as [CNKeyDescriptor]
     }
 }
+
+// MARK: - Entitlements Note
+/*
+ To enable notes synchronization, add this entitlement to your app:
+ 
+ In your .entitlements file:
+ <key>com.apple.developer.contacts.notes</key>
+ <true/>
+ 
+ Then uncomment CNContactNoteKey in the fetchKeys array above.
+ */
