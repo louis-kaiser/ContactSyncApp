@@ -11,18 +11,10 @@ import Contacts
 
 @main
 struct ContactSyncApp: App {
-    @StateObject private var viewModel = ContactSyncViewModel()
-
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(viewModel)
-                .onAppear {
-                    viewModel.checkAuthStatus()
-                    if viewModel.authorizationStatus == .authorized {
-                        viewModel.fetchAccounts()
-                    }
-                }
+                .frame(minWidth: 600, minHeight: 400)
         }
     }
 }

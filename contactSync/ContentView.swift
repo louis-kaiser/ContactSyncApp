@@ -1,167 +1,138 @@
-// MARK: - ContentView.swift
+// MARK: - Content View
 import SwiftUI
 import Contacts
 import Combine
 
 struct ContentView: View {
-    @EnvironmentObject private var vm: ContactSyncViewModel
-
+    @StateObject private var synchronizer = ContactSynchronizer()
+    
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            Divider()
-
-            switch vm.authorizationStatus {
-            case .notDetermined:
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("This app needs permission to access your contacts.")
-                    Button("Grant Access") {
-                        Task { await vm.requestAuth() }
+        VStack(spacing: 20) {
+            // Header
+            Text("Contact Account Synchronizer")
+                .font(.largeTitle)
+                .fontWeight(.bold)
+            
+            Text("Select accounts to synchronize")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+            
+            // Authorization Status
+            if synchronizer.authorizationStatus != .authorized {
+                VStack(spacing: 12) {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+                    
+                    Text("Contacts Access Required")
+                        .font(.headline)
+                    
+                    Text("This app needs access to your contacts to synchronize accounts.")
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.secondary)
+                    
+                    Button("Request Access") {
+                        Task {
+                            await synchronizer.requestAccess()
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                 }
-
-            case .denied, .restricted:
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Access Denied")
-                        .font(.headline)
-                    Text("Please enable Contacts access in System Settings → Privacy & Security → Contacts.")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-            default:
-                accountsList
-                controls
-            }
-
-            if vm.isSyncing {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text(vm.statusMessage)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 8)
-            } else if !vm.statusMessage.isEmpty {
-                Text(vm.statusMessage)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(20)
-        .sheet(isPresented: $vm.showMergeSheet) {
-            MergeApprovalSheet()
-                .environmentObject(vm)
-        }
-        .frame(minWidth: 640, minHeight: 520)
-    }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Contact Account Sync")
-                .font(.largeTitle.weight(.semibold))
-            Text("Select two or more accounts to mirror a unified, merged set of contacts across all of them.")
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var accountsList: some View {
-        Group {
-            if vm.allAccounts.isEmpty {
-                Text("No contact accounts found.")
-                    .foregroundStyle(.secondary)
+                .padding()
             } else {
-                List {
-                    Section("Available Accounts") {
-                        ForEach($vm.allAccounts) { $acct in
-                            HStack {
-                                Toggle(isOn: $acct.isSelected) {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(acct.container.name.isEmpty ? "Unnamed Account" : acct.container.name)
-                                        Text(acct.container.identifier)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                // Account List
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if synchronizer.accounts.isEmpty {
+                            Text("No accounts found")
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding()
+                        } else {
+                            ForEach(Array(synchronizer.accounts.enumerated()), id: \.offset) { index, account in
+                                HStack {
+                                    Toggle(isOn: Binding(
+                                        get: { synchronizer.accounts[index].isSelected },
+                                        set: { synchronizer.accounts[index].isSelected = $0 }
+                                    )) {
+                                        VStack(alignment: .leading) {
+                                            Text(account.name)
+                                                .font(.headline)
+                                        }
                                     }
+                                    .toggleStyle(.switch)
                                 }
+                                .padding(.vertical, 4)
                             }
                         }
                     }
+                    .padding()
                 }
-                .listStyle(.inset)
-                .frame(minHeight: 260)
-            }
-        }
-    }
-
-    private var controls: some View {
-        HStack(spacing: 12) {
-            Button {
-                Task { await vm.beginSyncProcess() }
-            } label: {
-                Text("Sync")
-                    .frame(minWidth: 80)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(vm.selectedContainerIDs.count < 2 || vm.isSyncing)
-
-            Button {
-                vm.showMergeSheet = true
-            } label: {
-                Text("Manual Merge")
-                    .frame(minWidth: 120)
-            }
-            .buttonStyle(.bordered)
-            .disabled(vm.duplicatesToMerge.isEmpty || vm.isSyncing)
-
-            Spacer()
-        }
-    }
-}
-
-struct MergeApprovalSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var vm: ContactSyncViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Review & Approve Merges")
-                .font(.title2.weight(.semibold))
-            Text("We detected \(vm.duplicatesToMerge.count) duplicate group\(vm.duplicatesToMerge.count == 1 ? "" : "s"). Approving will merge each group additively into a single “golden” contact. Nothing is deleted; new merged contacts will be created in every selected account.")
-                .foregroundStyle(.secondary)
-
-            List {
-                ForEach(Array(vm.duplicatesToMerge.enumerated()), id: \.offset) { idx, group in
-                    Section("Group \(idx + 1)") {
-                        ForEach(group, id: \.identifier) { contact in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(contact.givenName) \(contact.familyName)".trimmingCharacters(in: .whitespaces))
-                                    .font(.headline)
-                                if !contact.emailAddresses.isEmpty {
-                                    Text(contact.emailAddresses
-                                        .compactMap { ($0.value as String) }
-                                        .joined(separator: ", "))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .frame(minHeight: 280)
-
-            HStack {
-                Button("Cancel") { dismiss() }
-                Spacer()
-                Button("Approve All & Save") {
+                .frame(maxHeight: 300)
+                .background(Color(NSColor.textBackgroundColor))
+                .cornerRadius(8)
+                
+                // Sync Button
+                Button(action: {
                     Task {
-                        await vm.approveAllMergesAndSave()
-                        dismiss()
+                        await synchronizer.synchronizeSelectedAccounts()
                     }
+                }) {
+                    HStack {
+                        if synchronizer.isLoading {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                                .frame(width: 16, height: 16)
+                        } else {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                        }
+                        Text("Synchronize Selected Accounts")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(vm.isSyncing)
+                .disabled(synchronizer.isLoading || synchronizer.accounts.filter { $0.isSelected }.count < 2)
+                .controlSize(.large)
+            }
+            
+            // Status Message
+            if !synchronizer.statusMessage.isEmpty {
+                Text(synchronizer.statusMessage)
+                    .font(.callout)
+                    .foregroundColor(synchronizer.statusMessage.hasPrefix("✓") ? .green : .primary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task {
+            if synchronizer.authorizationStatus == .authorized {
+                await synchronizer.loadAccounts()
             }
         }
-        .padding(20)
-        .frame(minWidth: 640, minHeight: 520)
     }
 }
+
+// MARK: - Extensions
+
+extension CNContainerType {
+    var displayName: String {
+        switch self {
+        case .local: return "Local"
+        case .exchange: return "Exchange"
+        case .cardDAV: return "CardDAV"
+        @unknown default: return "Unknown"
+        }
+    }
+}
+
+// MARK: - Preview
+
+#Preview {
+    ContentView()
+        .frame(width: 600, height: 500)
+}
+

@@ -1,540 +1,409 @@
-import Foundation
 import SwiftUI
 import Contacts
+import AppKit
 import Combine
-
-// MARK: - View Model
-
-@MainActor
-final class ContactSyncViewModel: ObservableObject {
-
-    // MARK: Published UI State
-
-    @Published var contactStore = CNContactStore()
-    @Published var allAccounts: [SelectableAccount] = []
-    @Published var authorizationStatus: CNAuthorizationStatus = .notDetermined
-
-    /// Duplicate groups awaiting manual approval; each inner array is one group.
-    @Published var duplicatesToMerge: [[CNContact]] = []
-    /// Contacts with no duplicates in the selected accounts.
-    @Published var safeToSync: [CNContact] = []
-
-    @Published var isSyncing: Bool = false
-    @Published var statusMessage: String = ""
-    @Published var showMergeSheet: Bool = false
-
-    // MARK: Derived
-
-    var selectedContainerIDs: [String] {
-        allAccounts.filter { $0.isSelected }.map { $0.container.identifier }
-    }
-
-    // MARK: Lifecycle / Permissions
-
-    func checkAuthStatus() {
-        authorizationStatus = CNContactStore.authorizationStatus(for: .contacts)
-    }
-
-    func requestAuth() async {
-        do {
-            let granted = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
-                contactStore.requestAccess(for: .contacts) { granted, err in
-                    if let err { cont.resume(throwing: err) } else { cont.resume(returning: granted) }
-                }
-            }
-            authorizationStatus = granted ? .authorized : .denied
-            if granted { fetchAccounts() }
-        } catch {
-            authorizationStatus = .denied
-            statusMessage = "Failed to request access: \(error.localizedDescription)"
-        }
-    }
-
-    func fetchAccounts() {
-        do {
-            let containers = try contactStore.containers(matching: nil)
-            allAccounts = containers.map { SelectableAccount(container: $0, isSelected: false) }
-            statusMessage = allAccounts.isEmpty ? "No accounts were found." : ""
-        } catch {
-            statusMessage = "Could not fetch accounts: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: Sync Orchestration
-
-    /// Master entry-point from the "Sync" button. This fetches and analyzes contacts
-    /// and prepares duplicate groups for manual approval. If no duplicates are found,
-    /// it saves the "safe-to-sync" set immediately.
-    func beginSyncProcess() async {
-        guard authorizationStatus == .authorized else {
-            statusMessage = "Contacts access is required."
-            return
-        }
-        guard selectedContainerIDs.count >= 2 else {
-            statusMessage = "Select at least two accounts to sync."
-            return
-        }
-
-        isSyncing = true
-        statusMessage = "Fetching contacts…"
-
-        do {
-            // 1) Fetch raw (non-unified) contacts across the store; attach each to its container.
-            let fetched = try await fetchContactsForSelectedContainers()
-
-            // 2) Analyze for duplicates (strict definition) and compute safe set.
-            statusMessage = "Analyzing duplicates…"
-            let (dupeGroups, safe) = groupDuplicatesAndSafe(contacts: fetched)
-
-            self.duplicatesToMerge = dupeGroups
-            self.safeToSync = safe
-
-            if dupeGroups.isEmpty {
-                // No manual approval needed; persist the safe set immediately.
-                statusMessage = "No duplicates found. Saving contacts…"
-                try await saveContactsToAllSelected(accounts: selectedContainerIDs,
-                                                    contacts: safe)
-                statusMessage = "Sync complete."
-            } else {
-                statusMessage = "Found \(dupeGroups.count) duplicate group\(dupeGroups.count == 1 ? "" : "s"). Review and approve to continue."
-                showMergeSheet = true
-            }
-        } catch {
-            statusMessage = "Sync failed: \(error.localizedDescription)"
-        }
-
-        isSyncing = false
-    }
-
-    /// Called by the sheet's "Approve All & Save".
-    func approveAllMergesAndSave() async {
-        guard !isSyncing else { return }
-        guard authorizationStatus == .authorized else {
-            statusMessage = "Contacts access is required."
-            return
-        }
-        guard selectedContainerIDs.count >= 2 else {
-            statusMessage = "Select at least two accounts to sync."
-            return
-        }
-
-        isSyncing = true
-        statusMessage = "Merging duplicates…"
-
-        do {
-            // 1) Produce golden contacts for each duplicate group.
-            let mergedGoldens: [CNMutableContact] = duplicatesToMerge.map { performMerge(for: $0) }
-
-            // 2) Persist golden + safe-to-sync into each selected container.
-            statusMessage = "Saving to \(selectedContainerIDs.count) accounts…"
-            let contactsToSave: [CNContact] = mergedGoldens + safeToSync
-            try await saveContactsToAllSelected(accounts: selectedContainerIDs,
-                                                contacts: contactsToSave)
-
-            // 3) Clean state.
-            duplicatesToMerge.removeAll()
-            safeToSync.removeAll()
-            statusMessage = "Sync complete."
-        } catch {
-            statusMessage = "Save failed: \(error.localizedDescription)"
-        }
-
-        isSyncing = false
-    }
-
-    // MARK: Fetching
-
-    /// Returns all non-unified contacts for the selected containers, each paired with its container ID.
-    private func fetchContactsForSelectedContainers() async throws -> [FetchedContact] {
-        // Fetch non-unified results so duplicates across accounts are not pre-unified by the system.
-        let keys: [CNKeyDescriptor] = [
-            CNContactIdentifierKey as CNKeyDescriptor,
-            CNContactGivenNameKey as CNKeyDescriptor,
-            CNContactFamilyNameKey as CNKeyDescriptor,
-            CNContactMiddleNameKey as CNKeyDescriptor,
-            CNContactOrganizationNameKey as CNKeyDescriptor,
-            CNContactDepartmentNameKey as CNKeyDescriptor,
-            CNContactJobTitleKey as CNKeyDescriptor,
-            CNContactPhoneNumbersKey as CNKeyDescriptor,
-            CNContactEmailAddressesKey as CNKeyDescriptor,
-            CNContactPostalAddressesKey as CNKeyDescriptor,
-            CNContactUrlAddressesKey as CNKeyDescriptor,
-            CNContactSocialProfilesKey as CNKeyDescriptor,
-            CNContactInstantMessageAddressesKey as CNKeyDescriptor,
-            CNContactDatesKey as CNKeyDescriptor,
-            CNContactBirthdayKey as CNKeyDescriptor,
-            CNContactNoteKey as CNKeyDescriptor,
-            CNContactImageDataKey as CNKeyDescriptor
-        ]
-
-        return try await withCheckedThrowingContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                var results: [FetchedContact] = []
-                do {
-                    let req = CNContactFetchRequest(keysToFetch: keys)
-                    req.unifyResults = false // CRITICAL: fetch raw records across containers
-
-                    try self.contactStore.enumerateContacts(with: req) { contact, _ in
-                        // Resolve the container of this raw contact.
-                        // This is efficient enough in practice; we could cache if needed.
-                        let predicate = CNContainer.predicateForContainerOfContact(withIdentifier: contact.identifier)
-                        if let container = try? self.contactStore.containers(matching: predicate).first,
-                           self.selectedContainerIDs.contains(container.identifier) {
-                            results.append(FetchedContact(contact: contact, containerID: container.identifier))
-                        }
-                    }
-                    cont.resume(returning: results)
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    // MARK: Duplicate Analysis
-
-    /// Groups duplicates by (full name, shared email across different accounts) and returns (duplicate groups, safe contacts).
-    /// Algorithm notes:
-    /// - Within a name bucket (exact given+family match, case-insensitive), we build edges between any two contacts
-    ///   that share at least one identical email (case-insensitive) and come from different containers.
-    /// - Connected components of size ≥ 2 with ≥ 2 distinct container IDs form duplicate groups.
-    private func groupDuplicatesAndSafe(contacts: [FetchedContact]) -> (dupes: [[CNContact]], safe: [CNContact]) {
-        // Bucket by strict full name (given + family).
-        let buckets = Dictionary(grouping: contacts) { (fc: FetchedContact) -> String in
-            let g = fc.contact.givenName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let f = fc.contact.familyName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return g + "||" + f
-        }
-
-        var duplicateGroups: [[CNContact]] = []
-        var seenAsDuplicate = Set<String>() // CNContact.identifier
-
-        for (_, group) in buckets {
-            guard group.count >= 2 else { continue }
-
-            // Index mapping for union-find within this bucket
-            let n = group.count
-            var uf = UnionFind(count: n)
-
-            // Map email -> indices with that email
-            var emailMap: [String: [Int]] = [:]
-            for (i, fc) in group.enumerated() {
-                let emails = fc.contact.emailAddresses.compactMap { ($0.value as String).lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
-                for e in Set(emails) { // de-dup per contact
-                    emailMap[e, default: []].append(i)
-                }
-            }
-
-            // Connect indices that share an email and belong to different containers.
-            for (_, idxs) in emailMap {
-                if idxs.count < 2 { continue }
-                // For each pair in indices: union if containers differ.
-                for i in 0..<idxs.count {
-                    for j in (i+1)..<idxs.count {
-                        if group[idxs[i]].containerID != group[idxs[j]].containerID {
-                            uf.union(idxs[i], idxs[j])
-                        }
-                    }
-                }
-            }
-
-            // Build components.
-            let comps = uf.components()
-            for comp in comps {
-                guard comp.count >= 2 else { continue }
-                let distinctContainers = Set(comp.map { group[$0].containerID })
-                guard distinctContainers.count >= 2 else { continue }
-
-                let contactsComp = comp.map { group[$0].contact }
-                duplicateGroups.append(contactsComp)
-                for c in contactsComp { seenAsDuplicate.insert(c.identifier) }
-            }
-        }
-
-        // Safe = all contacts that were not captured in any duplicate component.
-        let safe = contacts
-            .filter { !seenAsDuplicate.contains($0.contact.identifier) }
-            .map { $0.contact }
-
-        return (duplicateGroups, safe)
-    }
-
-    // MARK: Merge Engine (Additive)
-
-    /// Produces a “golden” contact by copying the first and additively appending unique labeled values
-    /// from the rest. Singular fields are kept from the first unless empty, in which case they’re filled.
-    func performMerge(for group: [CNContact]) -> CNMutableContact {
-        precondition(!group.isEmpty, "Group must not be empty")
-        let base = group[0]
-        let golden = mutableClone(of: base)
-
-        // Helper to fill singular fields if missing on golden.
-        func fillIfEmpty(_ apply: () -> Void, isEmpty: Bool) {
-            if isEmpty { apply() }
-        }
-
-        for contact in group.dropFirst() {
-            var c = contact // shorthand
-
-            // Additive unique merges for labeled values (dedup by label+value semantics).
-            golden.phoneNumbers = addUniquePhoneNumbers(existing: golden.phoneNumbers, incoming: c.phoneNumbers)
-            golden.emailAddresses = addUniqueEmails(existing: golden.emailAddresses, incoming: c.emailAddresses)
-            golden.postalAddresses = addUniquePostal(existing: golden.postalAddresses, incoming: c.postalAddresses)
-            golden.urlAddresses = addUniqueURLs(existing: golden.urlAddresses, incoming: c.urlAddresses)
-            golden.socialProfiles = addUniqueSocial(existing: golden.socialProfiles, incoming: c.socialProfiles)
-            golden.instantMessageAddresses = addUniqueIM(existing: golden.instantMessageAddresses, incoming: c.instantMessageAddresses)
-            golden.dates = addUniqueDates(existing: golden.dates, incoming: c.dates)
-
-            // Singular fields: keep base if present; otherwise fill from others.
-            if golden.middleName.isEmpty, !c.middleName.isEmpty { golden.middleName = c.middleName }
-            if golden.organizationName.isEmpty, !c.organizationName.isEmpty { golden.organizationName = c.organizationName }
-            if golden.departmentName.isEmpty, !c.departmentName.isEmpty { golden.departmentName = c.departmentName }
-            if golden.jobTitle.isEmpty, !c.jobTitle.isEmpty { golden.jobTitle = c.jobTitle }
-
-            if golden.birthday == nil, let b = c.birthday { golden.birthday = b }
-
-            // Image: prefer base if present; otherwise take first non-empty.
-            if golden.imageData == nil, let img = c.imageData { golden.imageData = img }
-
-            // Notes: append unique snippets (very light approach to avoid bloat).
-            let trimmedGolden = golden.note.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmedIncoming = c.note.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedIncoming.isEmpty, !trimmedGolden.contains(trimmedIncoming) {
-                golden.note = trimmedGolden.isEmpty ? trimmedIncoming : "\(trimmedGolden) | \(trimmedIncoming)"
-            }
-        }
-
-        return golden
-    }
-
-    // MARK: Saving
-
-    /// Saves all provided contacts into **each** selected account by creating new contacts per account.
-    /// Note: We create a fresh CNMutableContact per container to avoid reusing the same instance in a request.
-    private func saveContactsToAllSelected(accounts containerIDs: [String], contacts: [CNContact]) async throws {
-        try await withCheckedThrowingContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let save = CNSaveRequest()
-                    for c in contacts {
-                        for containerID in containerIDs {
-                            let mutable = (c as? CNMutableContact) ?? self.mutableClone(of: c)
-                            save.add(mutable, toContainerWithIdentifier: containerID)
-                        }
-                    }
-                    try self.contactStore.execute(save)
-                    cont.resume()
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    // MARK: Utilities (Cloning & Dedup Helpers)
-
-    private func mutableClone(of contact: CNContact) -> CNMutableContact {
-        // Copy all supported fields.
-        let m = CNMutableContact()
-        m.givenName = contact.givenName
-        m.familyName = contact.familyName
-        m.middleName = contact.middleName
-        m.organizationName = contact.organizationName
-        m.departmentName = contact.departmentName
-        m.jobTitle = contact.jobTitle
-        m.phoneNumbers = contact.phoneNumbers
-        m.emailAddresses = contact.emailAddresses
-        m.postalAddresses = contact.postalAddresses
-        m.urlAddresses = contact.urlAddresses
-        m.socialProfiles = contact.socialProfiles
-        m.instantMessageAddresses = contact.instantMessageAddresses
-        m.dates = contact.dates
-        m.birthday = contact.birthday
-        //m.note = contact.note
-        /*
-         Problem with sync notes
-         */
-        m.imageData = contact.imageData
-        return m
-    }
-
-    private func addUniquePhoneNumbers(
-        existing: [CNLabeledValue<CNPhoneNumber>],
-        incoming: [CNLabeledValue<CNPhoneNumber>]
-    ) -> [CNLabeledValue<CNPhoneNumber>] {
-        var result = existing
-        for val in incoming {
-            let isDup = result.contains { $0.label == val.label && $0.value.stringValue == val.value.stringValue }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniqueEmails(
-        existing: [CNLabeledValue<NSString>],
-        incoming: [CNLabeledValue<NSString>]
-    ) -> [CNLabeledValue<NSString>] {
-        var result = existing
-        for val in incoming {
-            let v = (val.value as String).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            let isDup = result.contains {
-                $0.label == val.label &&
-                ((($0.value as String).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)) == v)
-            }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniquePostal(
-        existing: [CNLabeledValue<CNPostalAddress>],
-        incoming: [CNLabeledValue<CNPostalAddress>]
-    ) -> [CNLabeledValue<CNPostalAddress>] {
-        func stringify(_ a: CNPostalAddress) -> String {
-            "\(a.street)|\(a.city)|\(a.state)|\(a.postalCode)|\(a.country)|\(a.isoCountryCode)"
-                .lowercased()
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        var result = existing
-        for val in incoming {
-            let key = stringify(val.value)
-            let isDup = result.contains { $0.label == val.label && stringify($0.value) == key }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniqueURLs(
-        existing: [CNLabeledValue<NSString>],
-        incoming: [CNLabeledValue<NSString>]
-    ) -> [CNLabeledValue<NSString>] {
-        var result = existing
-        for val in incoming {
-            let v = (val.value as String).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            let isDup = result.contains {
-                $0.label == val.label &&
-                ((($0.value as String).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)) == v)
-            }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniqueSocial(
-        existing: [CNLabeledValue<CNSocialProfile>],
-        incoming: [CNLabeledValue<CNSocialProfile>]
-    ) -> [CNLabeledValue<CNSocialProfile>] {
-        func key(_ p: CNSocialProfile) -> String {
-            "\(p.service ?? "")|\(p.username ?? "")|\(p.urlString ?? "")"
-                .lowercased()
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        var result = existing
-        for val in incoming {
-            let k = key(val.value)
-            let isDup = result.contains { $0.label == val.label && key($0.value) == k }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniqueIM(
-        existing: [CNLabeledValue<CNInstantMessageAddress>],
-        incoming: [CNLabeledValue<CNInstantMessageAddress>]
-    ) -> [CNLabeledValue<CNInstantMessageAddress>] {
-        func key(_ a: CNInstantMessageAddress) -> String {
-            "\(a.service ?? "")|\(a.username ?? "")"
-                .lowercased()
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        var result = existing
-        for val in incoming {
-            let k = key(val.value)
-            let isDup = result.contains { $0.label == val.label && key($0.value) == k }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-
-    private func addUniqueDates(
-        existing: [CNLabeledValue<NSDateComponents>],
-        incoming: [CNLabeledValue<NSDateComponents>]
-    ) -> [CNLabeledValue<NSDateComponents>] {
-        func key(_ d: NSDateComponents) -> String {
-            let dc = d as DateComponents
-            return "\(dc.era ?? -1)|\(dc.year ?? -1)|\(dc.month ?? -1)|\(dc.day ?? -1)|\(dc.hour ?? -1)|\(dc.minute ?? -1)"
-        }
-        var result = existing
-        for val in incoming {
-            let k = key(val.value)
-            let isDup = result.contains { $0.label == val.label && key($0.value) == k }
-            if !isDup { result.append(val) }
-        }
-        return result
-    }
-}
 
 // MARK: - Models
 
-struct SelectableAccount: Identifiable, Hashable {
-    var id: String { container.identifier }
-    let container: CNContainer
-    var isSelected: Bool
-}
-
-struct FetchedContact {
+/// Represents a potential duplicate contact requiring user resolution
+struct DuplicateContact: Identifiable {
+    let id = UUID()
     let contact: CNContact
-    let containerID: String
+    let sourceAccount: String
+    
+    var displayName: String {
+        "\(contact.givenName) \(contact.familyName)"
+    }
+    
+    var emailAddresses: String {
+        contact.emailAddresses.map { $0.value as String }.joined(separator: ", ")
+    }
 }
 
-// MARK: - Union-Find (Disjoint Set)
-// Used to find connected components of duplicates within a name bucket.
-// Two contacts are connected if they share ≥1 identical email AND come from different containers.
+/// Represents a contact account container
+struct ContactAccount: Identifiable {
+    let id: String
+    let name: String
+    let container: CNContainer
+    var isSelected: Bool = false
+}
 
-private struct UnionFind {
-    private var parent: [Int]
-    private var rank: [Int]
+// MARK: - Contact Synchronizer
 
-    init(count: Int) {
-        parent = Array(0..<count)
-        rank = Array(repeating: 0, count: count)
+@MainActor
+class ContactSynchronizer: ObservableObject {
+    @Published var accounts: [ContactAccount] = []
+    @Published var isLoading = false
+    @Published var statusMessage = ""
+    @Published var authorizationStatus: CNAuthorizationStatus = .notDetermined
+    
+    private let contactStore = CNContactStore()
+    private var duplicateResolutions: [String: Bool] = [:] // Key: "firstName lastName", Value: areSame
+    
+    // MARK: - Initialization
+    
+    init() {
+        updateAuthorizationStatus()
     }
-
-    mutating func find(_ x: Int) -> Int {
-        if parent[x] != x {
-            parent[x] = find(parent[x]) // path compression
-        }
-        return parent[x]
+    
+    // MARK: - Authorization
+    
+    func updateAuthorizationStatus() {
+        authorizationStatus = CNContactStore.authorizationStatus(for: .contacts)
     }
-
-    mutating func union(_ x: Int, _ y: Int) {
-        var rx = find(x)
-        var ry = find(y)
-        if rx == ry { return }
-        if rank[rx] < rank[ry] {
-            swap(&rx, &ry)
-        }
-        parent[ry] = rx
-        if rank[rx] == rank[ry] {
-            rank[rx] += 1
+    
+    func requestAccess() async {
+        do {
+            let granted = try await contactStore.requestAccess(for: .contacts)
+            authorizationStatus = granted ? .authorized : .denied
+            if granted {
+                await loadAccounts()
+            }
+        } catch {
+            statusMessage = "Access error: \(error.localizedDescription)"
         }
     }
-
-    func components() -> [[Int]] {
-        var groups: [Int: [Int]] = [:]
-        for i in 0..<parent.count {
-            let r = findNoPathCompression(i)
-            groups[r, default: []].append(i)
+    
+    // MARK: - Account Management
+    
+    func loadAccounts() async {
+        isLoading = true
+        statusMessage = "Loading accounts..."
+        
+        do {
+            let containers = try contactStore.containers(matching: nil)
+            accounts = containers.map { container in
+                ContactAccount(
+                    id: container.identifier,
+                    name: container.name,
+                    container: container
+                )
+            }
+            statusMessage = "Loaded \(accounts.count) account(s)"
+        } catch {
+            statusMessage = "Error loading accounts: \(error.localizedDescription)"
         }
-        return Array(groups.values)
+        
+        isLoading = false
     }
-
-    // A non-mutating find for use in components() to keep value semantics simple.
-    private func findNoPathCompression(_ x: Int) -> Int {
-        var x = x
-        var p = parent
-        while p[x] != x { x = p[x] }
-        return x
+    
+    // MARK: - Synchronization
+    
+    func synchronizeSelectedAccounts() async {
+        let selectedAccounts = accounts.filter { $0.isSelected }
+        
+        guard selectedAccounts.count >= 2 else {
+            statusMessage = "Please select at least 2 accounts to synchronize"
+            return
+        }
+        
+        isLoading = true
+        statusMessage = "Starting synchronization..."
+        duplicateResolutions.removeAll()
+        
+        do {
+            // Step 1: Fetch all contacts from selected accounts
+            statusMessage = "Fetching contacts from selected accounts..."
+            var allContactsByAccount: [String: [CNContact]] = [:]
+            
+            for account in selectedAccounts {
+                let contacts = try fetchContacts(from: account.container)
+                allContactsByAccount[account.id] = contacts
+            }
+            
+            // Step 2: De-duplicate and merge
+            statusMessage = "De-duplicating contacts..."
+            let mergedContacts = try await deduplicateAndMerge(contactsByAccount: allContactsByAccount)
+            
+            // Step 3: Sync to all selected accounts
+            statusMessage = "Syncing \(mergedContacts.count) contacts to all accounts..."
+            try await syncContactsToAccounts(contacts: mergedContacts, accounts: selectedAccounts)
+            
+            statusMessage = "✓ Synchronization complete! \(mergedContacts.count) contacts synced."
+        } catch {
+            statusMessage = "Sync error: \(error.localizedDescription)"
+        }
+        
+        isLoading = false
+    }
+    
+    // MARK: - Contact Fetching
+    
+    private func fetchContacts(from container: CNContainer) throws -> [CNContact] {
+        let predicate = CNContact.predicateForContactsInContainer(withIdentifier: container.identifier)
+        let keys = [
+            CNContactIdentifierKey,
+            CNContactGivenNameKey,
+            CNContactFamilyNameKey,
+            CNContactEmailAddressesKey,
+            CNContactPhoneNumbersKey,
+            CNContactPostalAddressesKey,
+            CNContactOrganizationNameKey,
+            CNContactJobTitleKey,
+            //CNContactNoteKey,
+            CNContactBirthdayKey,
+            CNContactDatesKey,
+            CNContactUrlAddressesKey,
+            CNContactSocialProfilesKey,
+            CNContactInstantMessageAddressesKey
+        ] as [CNKeyDescriptor]
+        
+        return try contactStore.unifiedContacts(matching: predicate, keysToFetch: keys)
+    }
+    
+    // MARK: - De-duplication Logic
+    
+    private func deduplicateAndMerge(contactsByAccount: [String: [CNContact]]) async throws -> [CNMutableContact] {
+        // Flatten all contacts
+        var allContacts: [(contact: CNContact, accountId: String)] = []
+        for (accountId, contacts) in contactsByAccount {
+            allContacts.append(contentsOf: contacts.map { ($0, accountId) })
+        }
+        
+        var processedIds = Set<String>()
+        var mergedContacts: [CNMutableContact] = []
+        
+        for (index, item) in allContacts.enumerated() {
+            let contact = item.contact
+            
+            // Skip if already processed
+            if processedIds.contains(contact.identifier) {
+                continue
+            }
+            
+            // Find all duplicates
+            var duplicates: [(contact: CNContact, accountId: String)] = [item]
+            
+            for otherIndex in (index + 1)..<allContacts.count {
+                let otherItem = allContacts[otherIndex]
+                let otherContact = otherItem.contact
+                
+                if processedIds.contains(otherContact.identifier) {
+                    continue
+                }
+                
+                if try await areDuplicates(contact, otherContact, item.accountId, otherItem.accountId) {
+                    duplicates.append(otherItem)
+                    processedIds.insert(otherContact.identifier)
+                }
+            }
+            
+            processedIds.insert(contact.identifier)
+            
+            // Merge duplicates if multiple found
+            let merged = try await mergeContacts(duplicates.map { $0.contact })
+            mergedContacts.append(merged)
+        }
+        
+        return mergedContacts
+    }
+    
+    private func areDuplicates(_ contact1: CNContact, _ contact2: CNContact, _ account1: String, _ account2: String) async throws -> Bool {
+        // Priority 1: Unique identifier matching (same contact in different accounts)
+        // Note: identifiers are unique per CNContactStore, so we use name matching
+        
+        // Priority 2: Name matching
+        let name1 = "\(contact1.givenName) \(contact1.familyName)".trimmingCharacters(in: .whitespaces)
+        let name2 = "\(contact2.givenName) \(contact2.familyName)".trimmingCharacters(in: .whitespaces)
+        
+        guard !name1.isEmpty && !name2.isEmpty && name1.lowercased() == name2.lowercased() else {
+            return false
+        }
+        
+        // Check if we already have a resolution for this name
+        let nameLowercase = name1.lowercased()
+        if let resolution = duplicateResolutions[nameLowercase] {
+            return resolution
+        }
+        
+        // Ask user for confirmation
+        let areSame = await confirmDuplicate(contact1: contact1, contact2: contact2)
+        duplicateResolutions[nameLowercase] = areSame
+        
+        return areSame
+    }
+    
+    private func confirmDuplicate(contact1: CNContact, contact2: CNContact) async -> Bool {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Duplicate Contact Detected"
+                
+                let name = "\(contact1.givenName) \(contact1.familyName)"
+                let email1 = contact1.emailAddresses.map { $0.value as String }.joined(separator: ", ")
+                let email2 = contact2.emailAddresses.map { $0.value as String }.joined(separator: ", ")
+                
+                var infoText = "Two contacts with the name '\(name)' were found.\n\n"
+                if !email1.isEmpty {
+                    infoText += "Contact 1 emails: \(email1)\n"
+                }
+                if !email2.isEmpty {
+                    infoText += "Contact 2 emails: \(email2)\n"
+                }
+                infoText += "\nAre these the same person?"
+                
+                alert.informativeText = infoText
+                alert.addButton(withTitle: "Yes, Same Person")
+                alert.addButton(withTitle: "No, Different People")
+                alert.alertStyle = .informational
+                
+                let response = alert.runModal()
+                continuation.resume(returning: response == .alertFirstButtonReturn)
+            }
+        }
+    }
+    
+    // MARK: - Contact Merging
+    
+    private func mergeContacts(_ contacts: [CNContact]) async throws -> CNMutableContact {
+        guard !contacts.isEmpty else {
+            throw NSError(domain: "ContactSync", code: 1, userInfo: [NSLocalizedDescriptionKey: "No contacts to merge"])
+        }
+        
+        // If only one contact, return mutable copy
+        if contacts.count == 1 {
+            return contacts[0].mutableCopy() as! CNMutableContact
+        }
+        
+        // Ask user how to merge
+        let mergeAction = await promptMergeAction(contacts: contacts)
+        
+        switch mergeAction {
+        case .skip:
+            // Return first contact as-is
+            return contacts[0].mutableCopy() as! CNMutableContact
+            
+        case .addMissing, .updateExisting:
+            // Create merged contact with union of all data
+            let merged = CNMutableContact()
+            
+            // Use first non-empty value for simple fields
+            merged.givenName = contacts.first(where: { !$0.givenName.isEmpty })?.givenName ?? ""
+            merged.familyName = contacts.first(where: { !$0.familyName.isEmpty })?.familyName ?? ""
+            merged.organizationName = contacts.first(where: { !$0.organizationName.isEmpty })?.organizationName ?? ""
+            merged.jobTitle = contacts.first(where: { !$0.jobTitle.isEmpty })?.jobTitle ?? ""
+            //merged.note = contacts.first(where: { !$0.note.isEmpty })?.note ?? ""
+            merged.birthday = contacts.first(where: { $0.birthday != nil })?.birthday
+            
+            // Merge phone numbers (union - keep all unique)
+            var allPhones: [CNLabeledValue<CNPhoneNumber>] = []
+            var phoneSet = Set<String>()
+            for contact in contacts {
+                for phone in contact.phoneNumbers {
+                    let digits = phone.value.stringValue.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                    if !phoneSet.contains(digits) {
+                        allPhones.append(phone)
+                        phoneSet.insert(digits)
+                    }
+                }
+            }
+            merged.phoneNumbers = allPhones
+            
+            // Merge email addresses (union - keep all unique)
+            var allEmails: [CNLabeledValue<NSString>] = []
+            var emailSet = Set<String>()
+            for contact in contacts {
+                for email in contact.emailAddresses {
+                    let emailStr = (email.value as String).lowercased()
+                    if !emailSet.contains(emailStr) {
+                        allEmails.append(email)
+                        emailSet.insert(emailStr)
+                    }
+                }
+            }
+            merged.emailAddresses = allEmails
+            
+            // Merge postal addresses (union)
+            var allAddresses: [CNLabeledValue<CNPostalAddress>] = []
+            for contact in contacts {
+                allAddresses.append(contentsOf: contact.postalAddresses)
+            }
+            merged.postalAddresses = allAddresses
+            
+            // Merge dates (union)
+            var allDates: [CNLabeledValue<NSDateComponents>] = []
+            for contact in contacts {
+                allDates.append(contentsOf: contact.dates)
+            }
+            merged.dates = allDates
+            
+            // Merge URLs (union)
+            var allUrls: [CNLabeledValue<NSString>] = []
+            for contact in contacts {
+                allUrls.append(contentsOf: contact.urlAddresses)
+            }
+            merged.urlAddresses = allUrls
+            
+            // Merge social profiles (union)
+            var allProfiles: [CNLabeledValue<CNSocialProfile>] = []
+            for contact in contacts {
+                allProfiles.append(contentsOf: contact.socialProfiles)
+            }
+            merged.socialProfiles = allProfiles
+            
+            // Merge instant messages (union)
+            var allIM: [CNLabeledValue<CNInstantMessageAddress>] = []
+            for contact in contacts {
+                allIM.append(contentsOf: contact.instantMessageAddresses)
+            }
+            merged.instantMessageAddresses = allIM
+            
+            return merged
+        }
+    }
+    
+    private func promptMergeAction(contacts: [CNContact]) async -> MergeAction {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Merge Contact Information"
+                alert.informativeText = "Found \(contacts.count) duplicate records for '\(contacts[0].givenName) \(contacts[0].familyName)'.\n\nHow would you like to handle this?"
+                alert.addButton(withTitle: "Add Missing Information")
+                alert.addButton(withTitle: "Update Existing Information")
+                alert.addButton(withTitle: "Skip")
+                alert.alertStyle = .informational
+                
+                let response = alert.runModal()
+                
+                switch response {
+                case .alertFirstButtonReturn:
+                    continuation.resume(returning: .addMissing)
+                case .alertSecondButtonReturn:
+                    continuation.resume(returning: .updateExisting)
+                default:
+                    continuation.resume(returning: .skip)
+                }
+            }
+        }
+    }
+    
+    enum MergeAction {
+        case addMissing
+        case updateExisting
+        case skip
+    }
+    
+    // MARK: - Sync to Accounts
+    
+    private func syncContactsToAccounts(contacts: [CNMutableContact], accounts: [ContactAccount]) async throws {
+        for account in accounts {
+            let saveRequest = CNSaveRequest()
+            
+            // Delete existing contacts in this account
+            let existingContacts = try fetchContacts(from: account.container)
+            for contact in existingContacts {
+                let mutableContact = contact.mutableCopy() as! CNMutableContact
+                saveRequest.delete(mutableContact)
+            }
+            
+            // Add merged contacts
+            for contact in contacts {
+                let newContact = contact.mutableCopy() as! CNMutableContact
+                saveRequest.add(newContact, toContainerWithIdentifier: account.container.identifier)
+            }
+            
+            try contactStore.execute(saveRequest)
+        }
     }
 }
 
