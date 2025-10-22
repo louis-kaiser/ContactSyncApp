@@ -7,14 +7,22 @@
 
 // MARK: - App.swift
 import SwiftUI
+import Contacts
 
 @main
 struct ContactSyncApp: App {
+    @StateObject private var viewModel = ContactSyncViewModel()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(viewModel)
+                .onAppear {
+                    viewModel.checkAuthStatus()
+                    if viewModel.authorizationStatus == .authorized {
+                        viewModel.fetchAccounts()
+                    }
+                }
         }
-        .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
     }
 }
